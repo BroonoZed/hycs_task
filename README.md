@@ -2,17 +2,21 @@
 
 Telegram 客服任务机器人（独立仓库，不影响原 hybot）。
 
-## 已实现（MVP）
+## 已实现（v2）
 
 - 监听指定客服群 `SUPPORT_GROUP_IDS`
-- 自动筛选“疑似问题消息”并建任务
+- 自动筛选“疑似问题消息”并建任务（含噪音过滤）
 - 汇总推送到任务频道 `TASK_CHANNEL_ID`
-- 任务超时计时（默认 SLA 10 分钟）+ 分级提醒（每任务最多 3 次）
-- 任务命令：
-  - `/task_list`
-  - `/task_done <task_id>`
-  - `/task_bind <task_id> <order_no>`
-  - `/task_order <task_id>`
+- 任务超时计时（默认 SLA 10 分钟）+ 提醒（每任务最多 3 次）
+- 任务状态流转：`OPEN -> PROCESSING -> DONE`
+  - `/task_claim <id>` 认领
+  - `/task_open <id>` 回退 OPEN
+  - `/task_done <id>` 完成
+- 任务卡片自动更新（状态/处理人/绑定订单）
+- 手动建任务：`/task_new`（回复消息触发）
+- 订单关联：
+  - `/task_bind <id> <order_no>`
+  - `/task_order <id>`
 - 快捷语库：
   - `/qr_add <key> <text>`
   - `/qr_list`
@@ -21,8 +25,6 @@ Telegram 客服任务机器人（独立仓库，不影响原 hybot）。
 - 订单查询：PostgreSQL（按 `order_no/mch_order_no`）
 
 ## 环境变量
-
-复制并编辑：
 
 ```bash
 cp .env.example .env
@@ -35,6 +37,7 @@ cp .env.example .env
 - `TASK_CHANNEL_ID=-1003892387186`
 - `ADMIN_TG_IDS`
 - `TASK_SLA_MINUTES=10`
+- `QUESTION_KEYWORDS` / `NOISE_KEYWORDS`
 - PostgreSQL 参数（如需 `/task_order`）
 
 ## 运行
@@ -49,6 +52,6 @@ python3 bot.py
 
 ## 说明
 
-- 本项目是新仓库开发，不改动原 `hybot`。
-- 任务筛选规则在 `looks_like_question()`，可按业务继续细化。
-- 如果任务频道为私有 channel，请确保 bot 已加入并有发言权限。
+- 本项目在新仓库开发，不改动原 `hybot`。
+- 自动任务筛选逻辑在 `looks_like_question()`，可继续按业务优化。
+- 若任务频道为私有 channel，确保 bot 已加入并具备发言/编辑消息权限。
