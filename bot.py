@@ -201,6 +201,12 @@ def get_task(task_id: int) -> Optional[Task]:
         return Task(**dict(row)) if row else None
 
 
+def get_task_by_channel_msg_id(channel_msg_id: int) -> Optional[Task]:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE task_channel_message_id = ?", (channel_msg_id,)).fetchone()
+        return Task(**dict(row)) if row else None
+
+
 def list_open_tasks(limit: int = 30) -> list[sqlite3.Row]:
     with closing(db()) as conn:
         return conn.execute(
@@ -395,6 +401,67 @@ async def create_task_from_message(update: Update, context: ContextTypes.DEFAULT
         disable_web_page_preview=True,
     )
     set_task_channel_msg(task_id, sent.message_id)
+
+
+def extract_task_id_from_text(text: str) -> Optional[int]:
+    s = (text or "").strip()
+    m = re.search(r"(?:^|\s)#(\d+)(?:\s|$)", s)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(?:task|任务)\s*#?(\d+)", s, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+async def relay_from_task_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not msg or not chat or chat.id != TASK_CHANNEL_ID:
+        return
+    if user and bool(getattr(user, "is_bot", False)):
+        return
+    if not is_admin(user.id if user else None):
+        return
+
+    task = None
+    if msg.reply_to_message:
+        task = get_task_by_channel_msg_id(msg.reply_to_message.message_id)
+
+    if task is None and msg.text:
+        tid = extract_task_id_from_text(msg.text)
+        if tid:
+            task = get_task(tid)
+
+    if task is None:
+        return
+
+    # 不允许回传到已完成任务，避免误发
+    if task.status == "DONE":
+        await msg.reply_text(f"⚠️ 任务 #{task.id} 已是 DONE，未回传。")
+        return
+
+    try:
+        sent = await context.bot.copy_message(
+            chat_id=task.source_chat_id,
+            from_chat_id=TASK_CHANNEL_ID,
+            message_id=msg.message_id,
+            reply_to_message_id=task.source_message_id,
+            allow_sending_without_reply=True,
+        )
+        if task.status == "OPEN":
+            name = user.full_name or user.username or str(user.id)
+            mark_processing(task.id, user.id if user else 0, name)
+            await refresh_task_card(context, task.id)
+        out_msg_id = sent.message_id if hasattr(sent, "message_id") else sent
+        await msg.reply_text(
+            f"✅ 已回传到源群 task #{task.id} -> {task.source_chat_id}:{out_msg_id}",
+            reply_to_message_id=msg.message_id,
+        )
+    except Exception as e:
+        logger.exception("relay_from_task_channel failed task=%s", task.id)
+        await msg.reply_text(f"❌ 回传失败 task #{task.id}: {e.__class__.__name__}: {e}")
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -647,6 +714,7 @@ def main():
     app.add_handler(CommandHandler("qr_list", cmd_qr_list))
     app.add_handler(CommandHandler("qr", cmd_qr))
 
+    app.add_handler(MessageHandler(filters.Chat(chat_id=TASK_CHANNEL_ID) & (~filters.COMMAND), relay_from_task_channel), group=0)
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_message), group=1)
 
     app.job_queue.run_repeating(job_overdue, interval=60, first=20, name="overdue-reminder")
