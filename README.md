@@ -42,7 +42,8 @@ cp .env.example .env
 - `ADMIN_TG_IDS`
 - `TASK_SLA_MINUTES=10`
 - `QUESTION_KEYWORDS` / `NOISE_KEYWORDS`
-- PostgreSQL 参数（如需 `/task_order`）
+- `ORDER_API_URL` / `ORDER_API_TOKEN`（推荐，走 hybot 内部 API）
+- PostgreSQL 参数（备选，如需 `/task_order` 直连DB）
 
 ## 运行
 
@@ -52,6 +53,31 @@ source .venv/bin/activate
 pip install -r requirements.txt
 set -a; source .env; set +a
 python3 bot.py
+```
+
+## 方案B：hybot 内部查单接口（推荐）
+
+`hycs_task` 已支持优先调用内部 API 查单：
+
+- `ORDER_API_URL` 例如：`http://127.0.0.1:8081/internal/order/query`
+- `ORDER_API_TOKEN` Bearer Token（可选但推荐）
+
+请求：
+
+```json
+{"order_token":"xxx"}
+```
+
+响应可用两种格式（任选其一）：
+
+```json
+{"ok":true,"data":{"order_no":"...","mch_order_no":"...","status":"..."}}
+```
+
+或直接：
+
+```json
+{"order_no":"...","mch_order_no":"...","status":"..."}
 ```
 
 ## 说明
