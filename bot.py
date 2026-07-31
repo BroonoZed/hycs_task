@@ -14,7 +14,7 @@ from typing import Optional
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -70,6 +70,9 @@ NOISE_IGNORE_USER_IDS = {int(x.strip()) for x in env("NOISE_IGNORE_USER_IDS", ""
 # 任务快捷回复规则："触发词:快捷语key|触发词2:key2"
 TASK_QR_RULES_RAW = env("TASK_QR_RULES", "")
 SQLITE_PATH = env("SQLITE_PATH", "tasks.db")
+BROADCAST_GROUP_IDS = {int(x.strip()) for x in env("BROADCAST_GROUP_IDS", env("SUPPORT_GROUP_IDS", "")).split(",") if x.strip()}
+BROADCAST_CONFIRM_TTL_MIN = int(env("BROADCAST_CONFIRM_TTL_MIN", "15"))
+CONTROL_CHAT_IDS = {int(x.strip()) for x in env("CONTROL_CHAT_IDS", str(TASK_CHANNEL_ID)).split(",") if x.strip()}
 
 ORDER_API_URL = env("ORDER_API_URL", "")
 ORDER_API_TOKEN = env("ORDER_API_TOKEN", "")
@@ -155,6 +158,21 @@ def init_sqlite() -> None:
                 v TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS broadcast_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                k TEXT NOT NULL UNIQUE,
+                v TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS broadcast_message_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                k TEXT NOT NULL UNIQUE,
+                source_chat_id INTEGER NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         # 兼容旧表结构
@@ -185,12 +203,40 @@ def is_admin_actor(update: Update) -> bool:
     return False
 
 
+def can_click_task_buttons(update: Update) -> bool:
+    """任务按钮允许任务频道内成员点击；管理命令仍走管理员校验。"""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or chat.id != TASK_CHANNEL_ID:
+        return False
+    if not user:
+        return False
+    return not bool(getattr(user, "is_bot", False))
+
+
 def is_support_group(chat_id: Optional[int]) -> bool:
     return chat_id is not None and chat_id in SUPPORT_GROUP_IDS
 
 
+def is_control_chat(chat_id: Optional[int]) -> bool:
+    return chat_id is not None and chat_id in CONTROL_CHAT_IDS
+
+
 def is_noise_ignored_user(uid: Optional[int]) -> bool:
     return uid is not None and uid in NOISE_IGNORE_USER_IDS
+
+
+def can_use_admin_cmd(update: Update) -> bool:
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    return is_admin_actor(update) and is_control_chat(chat_id)
+
+
+async def reject_admin_cmd(update: Update) -> None:
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    # 采集群静默拦截：不回“未授权”，避免打扰
+    if is_support_group(chat_id) and not is_control_chat(chat_id):
+        return
+    await reply_text(update, "未授权（仅控制频道可用）")
 
 
 def summarize(text: str, max_len: int = 140) -> str:
@@ -273,6 +319,20 @@ def get_task(task_id: int) -> Optional[Task]:
 def get_task_by_channel_msg_id(channel_msg_id: int) -> Optional[Task]:
     with closing(db()) as conn:
         row = conn.execute("SELECT * FROM tasks WHERE task_channel_message_id = ?", (channel_msg_id,)).fetchone()
+        return Task(**dict(row)) if row else None
+
+
+def get_latest_task_by_source_msg(chat_id: int, source_message_id: int) -> Optional[Task]:
+    with closing(db()) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE source_chat_id=? AND source_message_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (chat_id, source_message_id),
+        ).fetchone()
         return Task(**dict(row)) if row else None
 
 
@@ -601,7 +661,7 @@ async def relay_from_task_channel(update: Update, context: ContextTypes.DEFAULT_
         return
     if user and bool(getattr(user, "is_bot", False)):
         return
-    if not is_admin_actor(update):
+    if not can_use_admin_cmd(update):
         return
 
     task = None
@@ -652,6 +712,178 @@ def _split_cmd(text: str) -> tuple[str, list[str]]:
     return cmd, parts[1:]
 
 
+def parse_vars(raw: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for part in re.split(r"[,，]", (raw or "").strip()):
+        p = part.strip()
+        if not p or "=" not in p:
+            continue
+        k, v = p.split("=", 1)
+        key = k.strip()
+        if not key:
+            continue
+        out[key] = v.strip()
+    return out
+
+
+def builtin_vars() -> dict[str, str]:
+    now_local = datetime.now(UTC8)
+    return {
+        "now": now_local.strftime("%Y-%m-%d %H:%M:%S"),
+        "today": now_local.strftime("%Y-%m-%d"),
+        "time": now_local.strftime("%H:%M:%S"),
+        "date": now_local.strftime("%Y-%m-%d"),
+    }
+
+
+def render_template(text: str, variables: dict[str, str]) -> str:
+    # 支持 {{key}} 占位符
+    def _sub(m: re.Match[str]) -> str:
+        key = (m.group(1) or "").strip()
+        return variables.get(key, m.group(0))
+
+    return re.sub(r"\{\{\s*([a-zA-Z0-9_\-]+)\s*\}\}", _sub, text or "")
+
+
+async def build_broadcast_target_lines(context: ContextTypes.DEFAULT_TYPE, target_ids: list[int]) -> list[str]:
+    lines: list[str] = []
+    for cid in target_ids:
+        title = "(未知)"
+        try:
+            chat = await context.bot.get_chat(cid)
+            title = getattr(chat, "title", None) or getattr(chat, "full_name", None) or getattr(chat, "username", None) or "(无名称)"
+        except Exception:
+            pass
+        lines.append(f"- {cid} | {title}")
+    return lines
+
+
+def get_broadcast_targets() -> list[int]:
+    return sorted(BROADCAST_GROUP_IDS)
+
+
+async def prepare_broadcast_confirm(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str = "",
+    *,
+    mode: str = "text",
+    source_chat_id: int | None = None,
+    source_message_id: int | None = None,
+) -> None:
+    uid = update.effective_user.id if update.effective_user else None
+    if not is_admin(uid):
+        await reply_text(update, "未授权")
+        return
+
+    if mode == "text":
+        payload = (text or "").strip()
+        if not payload:
+            await reply_text(update, "公告内容不能为空")
+            return
+    else:
+        payload = ""
+        if source_chat_id is None or source_message_id is None:
+            await reply_text(update, "缺少源消息，无法保留原格式群发")
+            return
+
+    targets = get_broadcast_targets()
+    if not targets:
+        await reply_text(update, "未配置群发目标。请设置 BROADCAST_GROUP_IDS 或 SUPPORT_GROUP_IDS")
+        return
+
+    token = f"{uid}:{int(now_utc().timestamp())}"
+    pending = context.application.bot_data.setdefault("broadcast_pending", {})
+    pending[token] = {
+        "uid": uid,
+        "mode": mode,
+        "text": payload,
+        "source_chat_id": source_chat_id,
+        "source_message_id": source_message_id,
+        "targets": targets,
+        "created_at": now_str(),
+    }
+
+    lines = ["📢 群发确认", "", "目标群："]
+    lines.extend(await build_broadcast_target_lines(context, targets))
+    if mode == "text":
+        lines.extend(["", "内容预览：", payload[:1200]])
+    else:
+        lines.extend(["", f"内容预览：将转发源消息（保留原格式）", f"源消息: {source_chat_id}:{source_message_id}"])
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ 确认发送", callback_data=f"bc:confirm:{token}")], [InlineKeyboardButton("❌ 取消", callback_data=f"bc:cancel:{token}")]]
+    )
+    await reply_text(update, "\n".join(lines), reply_markup=kb)
+
+
+async def on_broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    m = re.fullmatch(r"bc:(confirm|cancel):(.+)", q.data)
+    if not m:
+        return
+
+    action, token = m.group(1), m.group(2)
+    pending = context.application.bot_data.setdefault("broadcast_pending", {})
+    item = pending.get(token)
+
+    if not item:
+        await q.answer("确认已过期", show_alert=True)
+        return
+
+    uid = update.effective_user.id if update.effective_user else None
+    if uid != item.get("uid") and not is_admin(uid):
+        await q.answer("仅发起人可操作", show_alert=True)
+        return
+
+    created_at = datetime.fromisoformat(item["created_at"])
+    if now_utc() - created_at > timedelta(minutes=BROADCAST_CONFIRM_TTL_MIN):
+        pending.pop(token, None)
+        await q.answer("确认超时，请重新发起", show_alert=True)
+        return
+
+    if action == "cancel":
+        pending.pop(token, None)
+        await q.answer("已取消")
+        try:
+            await q.edit_message_text("已取消群发")
+        except Exception:
+            pass
+        return
+
+    mode = item.get("mode", "text")
+    text = item.get("text", "")
+    src_chat_id = item.get("source_chat_id")
+    src_msg_id = item.get("source_message_id")
+    targets: list[int] = item.get("targets", [])
+    ok, fail = 0, []
+    for cid in targets:
+        try:
+            if mode == "copy":
+                await context.bot.copy_message(
+                    chat_id=cid,
+                    from_chat_id=int(src_chat_id),
+                    message_id=int(src_msg_id),
+                )
+            else:
+                await context.bot.send_message(chat_id=cid, text=text)
+            ok += 1
+        except Exception as e:
+            fail.append(f"{cid}: {e.__class__.__name__}")
+
+    pending.pop(token, None)
+    await q.answer(f"已发送 {ok}/{len(targets)}")
+    result = [f"群发完成：成功 {ok}/{len(targets)}"]
+    if fail:
+        result.append("失败：")
+        result.extend([f"- {x}" for x in fail[:20]])
+    try:
+        await q.edit_message_text("\n".join(result)[:3900])
+    except Exception:
+        await q.message.reply_text("\n".join(result)[:3900])
+
+
 async def on_task_channel_command_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat = update.effective_chat
@@ -666,7 +898,7 @@ async def on_task_channel_command_fallback(update: Update, context: ContextTypes
     logger.info("task_channel_fallback cmd=%s args=%s chat=%s user=%s", cmd, args, chat.id, user.id if user else None)
 
     uid = user.id if user else None
-    if not is_admin_actor(update):
+    if not can_use_admin_cmd(update):
         await msg.reply_text("未授权")
         return
 
@@ -700,6 +932,28 @@ async def on_task_channel_command_fallback(update: Update, context: ContextTypes
             await msg.reply_text(f"✅ 已移出过滤名单: {uid2}")
         return
 
+    if cmd == "support_group_list":
+        if not SUPPORT_GROUP_IDS:
+            await msg.reply_text("当前采集群为空")
+            return
+        await msg.reply_text("采集群ID名单：\n" + "\n".join(str(x) for x in sorted(SUPPORT_GROUP_IDS)))
+        return
+
+    if cmd in {"support_group_add", "support_group_del"}:
+        if len(args) != 1 or not args[0].lstrip('-').isdigit():
+            await msg.reply_text(f"用法: /{cmd} <chat_id>")
+            return
+        gid = int(args[0])
+        if cmd == "support_group_add":
+            SUPPORT_GROUP_IDS.add(gid)
+            set_env_key("SUPPORT_GROUP_IDS", ",".join(str(x) for x in sorted(SUPPORT_GROUP_IDS)))
+            await msg.reply_text(f"✅ 已加入采集群: {gid}")
+        else:
+            SUPPORT_GROUP_IDS.discard(gid)
+            set_env_key("SUPPORT_GROUP_IDS", ",".join(str(x) for x in sorted(SUPPORT_GROUP_IDS)))
+            await msg.reply_text(f"✅ 已移出采集群: {gid}")
+        return
+
     if cmd in {"task_claim", "task_open", "task_done", "task_order", "task_sla"}:
         if len(args) != 1 or not args[0].isdigit():
             usage = {
@@ -731,8 +985,9 @@ async def on_task_channel_command_fallback(update: Update, context: ContextTypes
             if not mark_done(n):
                 await msg.reply_text("任务不存在或已完成")
                 return
+            operator = (user.full_name or user.username) if user else "unknown"
             await refresh_task_card(context, n)
-            await msg.reply_text(f"✅ 任务 #{n} 已完成")
+            await msg.reply_text(f"✅ 任务 #{n} 已由 {operator} 完成")
             return
         if cmd == "task_order":
             task = get_task(n)
@@ -773,6 +1028,36 @@ async def on_task_channel_command_fallback(update: Update, context: ContextTypes
         await msg.reply_text(f"✅ 任务 #{task_id} 已绑定订单 {order_no}")
         return
 
+    if cmd == "bc_tpl_set":
+        context.args = args
+        await cmd_bc_tpl_set(update, context)
+        return
+
+    if cmd == "bc_tpl_list":
+        context.args = args
+        await cmd_bc_tpl_list(update, context)
+        return
+
+    if cmd == "bc_tpl_del":
+        context.args = args
+        await cmd_bc_tpl_del(update, context)
+        return
+
+    if cmd == "bc_send":
+        context.args = args
+        await cmd_bc_send(update, context)
+        return
+
+    if cmd == "bc_send_tpl":
+        context.args = args
+        await cmd_bc_send_tpl(update, context)
+        return
+
+    if cmd == "bc_vars":
+        context.args = args
+        await cmd_bc_vars(update, context)
+        return
+
 
 async def on_task_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -787,8 +1072,8 @@ async def on_task_action_callback(update: Update, context: ContextTypes.DEFAULT_
     action, sid = m.group(1), m.group(2)
     task_id = int(sid)
     uid = update.effective_user.id if update.effective_user else None
-    if not is_admin(uid):
-        await q.answer("未授权", show_alert=True)
+    if not can_click_task_buttons(update):
+        await q.answer("仅任务频道成员可操作", show_alert=True)
         return
 
     if action == "claim":
@@ -815,8 +1100,13 @@ async def on_task_action_callback(update: Update, context: ContextTypes.DEFAULT_
         if not ok:
             await q.answer("任务不存在或已完成", show_alert=True)
             return
+        operator = update.effective_user.full_name or update.effective_user.username or str(uid)
         await refresh_task_card(context, task_id)
-        await q.answer(f"已完成 #{task_id}")
+        await q.answer(f"#{task_id} 已由 {operator} 完成")
+        try:
+            await q.message.reply_text(f"✅ 任务 #{task_id} 已由 {operator} 完成")
+        except Exception:
+            pass
         return
 
 
@@ -831,8 +1121,8 @@ async def on_task_qr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     task_id = int(sid)
 
     uid = update.effective_user.id if update.effective_user else None
-    if not is_admin(uid):
-        await q.answer("未授权", show_alert=True)
+    if not can_click_task_buttons(update):
+        await q.answer("仅任务频道成员可操作", show_alert=True)
         return
 
     task = get_task(task_id)
@@ -877,8 +1167,8 @@ def build_open_task_summary(limit: int = 20) -> str:
 
 
 async def cmd_task_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_actor(update):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     await reply_text(update, panel_text(), parse_mode=ParseMode.HTML, reply_markup=panel_kb())
 
@@ -928,9 +1218,30 @@ async def on_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
     if not msg or not msg.text:
         return
-    await create_task_from_message(update, context, msg.text, force=False)
+
+    # 规则：过滤名单内用户在采集群里“回复了某条任务源消息”时，自动认领该任务
+    if chat and user and is_support_group(chat.id) and is_noise_ignored_user(user.id) and msg.reply_to_message:
+        task = get_latest_task_by_source_msg(chat.id, msg.reply_to_message.message_id)
+        if task and task.status != "DONE":
+            assignee_name = user.full_name or user.username or str(user.id)
+            changed = mark_processing(task.id, user.id, assignee_name)
+            if changed:
+                await refresh_task_card(context, task.id)
+                try:
+                    await context.bot.send_message(
+                        chat_id=TASK_CHANNEL_ID,
+                        text=f"👤 任务 #{task.id} 已由 {assignee_name}（回复源消息）自动认领",
+                    )
+                except Exception:
+                    pass
+
+    # 采集群内：机器人消息也纳入监听（即便是命令样式文本）
+    force_for_bot = bool(user and getattr(user, "is_bot", False))
+    await create_task_from_message(update, context, msg.text, force=force_for_bot)
 
 
 async def on_command_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -954,8 +1265,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_task_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     msg = update.effective_message
     if not msg or not msg.reply_to_message or not msg.reply_to_message.text:
@@ -990,8 +1301,8 @@ async def cmd_task_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_task_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     rows = list_open_tasks(limit=30)
     if not rows:
@@ -1014,8 +1325,8 @@ def _parse_task_id(args: list[str]) -> Optional[int]:
 
 async def cmd_task_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
-    if not is_admin(uid):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     task_id = _parse_task_id(context.args)
     if task_id is None:
@@ -1032,8 +1343,8 @@ async def cmd_task_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_task_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
-    if not is_admin(uid):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     task_id = _parse_task_id(context.args)
     if task_id is None:
@@ -1049,8 +1360,8 @@ async def cmd_task_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_task_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
-    if not is_admin(uid):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     task_id = _parse_task_id(context.args)
     if task_id is None:
@@ -1060,14 +1371,15 @@ async def cmd_task_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ok:
         await reply_text(update, "任务不存在或已完成")
         return
+    operator = update.effective_user.full_name or update.effective_user.username or str(uid)
     await refresh_task_card(context, task_id)
-    await reply_text(update, f"✅ 任务 #{task_id} 已完成")
+    await reply_text(update, f"✅ 任务 #{task_id} 已由 {operator} 完成")
 
 
 async def cmd_task_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
-    if not is_admin(uid):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     if len(context.args) != 2 or not context.args[0].isdigit():
         await reply_text(update, "用法: /task_bind <task_id> <order_no>")
@@ -1084,8 +1396,8 @@ async def cmd_task_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_task_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
-    if not is_admin(uid):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     task_id = _parse_task_id(context.args)
     if task_id is None:
@@ -1112,8 +1424,8 @@ async def cmd_task_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_task_sla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CURRENT_TASK_SLA_MINUTES
     uid = update.effective_user.id if update.effective_user else None
-    if not is_admin(uid):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     if len(context.args) != 1 or not context.args[0].isdigit():
         await reply_text(update, f"当前 SLA={CURRENT_TASK_SLA_MINUTES} 分钟。用法: /task_sla <minutes>")
@@ -1127,8 +1439,8 @@ async def cmd_task_sla(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_noise_ignore_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_actor(update):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     if not NOISE_IGNORE_USER_IDS:
         await reply_text(update, "当前过滤用户名单为空")
@@ -1138,8 +1450,8 @@ async def cmd_noise_ignore_list(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def cmd_noise_ignore_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_actor(update):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     if len(context.args) != 1 or not context.args[0].lstrip('-').isdigit():
         await reply_text(update, "用法: /noise_ignore_add <user_id>")
@@ -1151,8 +1463,8 @@ async def cmd_noise_ignore_add(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def cmd_noise_ignore_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_actor(update):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     if len(context.args) != 1 or not context.args[0].lstrip('-').isdigit():
         await reply_text(update, "用法: /noise_ignore_del <user_id>")
@@ -1163,9 +1475,45 @@ async def cmd_noise_ignore_del(update: Update, context: ContextTypes.DEFAULT_TYP
     await reply_text(update, f"✅ 已移出过滤名单: {uid}")
 
 
+async def cmd_support_group_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
+        return
+    if not SUPPORT_GROUP_IDS:
+        await reply_text(update, "当前采集群为空")
+        return
+    await reply_text(update, "采集群ID名单：\n" + "\n".join(str(x) for x in sorted(SUPPORT_GROUP_IDS)))
+
+
+async def cmd_support_group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
+        return
+    if len(context.args) != 1 or not context.args[0].lstrip('-').isdigit():
+        await reply_text(update, "用法: /support_group_add <chat_id>")
+        return
+    gid = int(context.args[0])
+    SUPPORT_GROUP_IDS.add(gid)
+    set_env_key("SUPPORT_GROUP_IDS", ",".join(str(x) for x in sorted(SUPPORT_GROUP_IDS)))
+    await reply_text(update, f"✅ 已加入采集群: {gid}")
+
+
+async def cmd_support_group_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
+        return
+    if len(context.args) != 1 or not context.args[0].lstrip('-').isdigit():
+        await reply_text(update, "用法: /support_group_del <chat_id>")
+        return
+    gid = int(context.args[0])
+    SUPPORT_GROUP_IDS.discard(gid)
+    set_env_key("SUPPORT_GROUP_IDS", ",".join(str(x) for x in sorted(SUPPORT_GROUP_IDS)))
+    await reply_text(update, f"✅ 已移出采集群: {gid}")
+
+
 async def cmd_qr_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await reply_text(update, "未授权")
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
         return
     if len(context.args) < 2:
         await reply_text(update, "用法: /qr_add <key> <text>")
@@ -1203,6 +1551,161 @@ async def cmd_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_text(update, row["v"])
 
 
+async def cmd_bc_tpl_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
+        return
+    if not context.args:
+        await reply_text(update, "用法: /bc_tpl_set <key> <模板内容>\n或：回复一条消息后 /bc_tpl_set <key>（保留原格式）")
+        return
+    k = context.args[0].strip().lower()
+    if not re.fullmatch(r"[a-zA-Z0-9_\-]{1,40}", k):
+        await reply_text(update, "key 仅支持字母/数字/_/-，且不超过40字符")
+        return
+
+    msg = update.effective_message
+    if msg and msg.reply_to_message and len(context.args) == 1:
+        src = msg.reply_to_message
+        with closing(db()) as conn:
+            conn.execute(
+                "INSERT INTO broadcast_message_templates(k, source_chat_id, source_message_id, updated_at) VALUES(?,?,?,?) ON CONFLICT(k) DO UPDATE SET source_chat_id=excluded.source_chat_id, source_message_id=excluded.source_message_id, updated_at=excluded.updated_at",
+                (k, int(src.chat_id), int(src.message_id), now_str()),
+            )
+            conn.commit()
+        await reply_text(update, f"✅ 公告模板已保存(原格式消息): {k}")
+        return
+
+    if len(context.args) < 2:
+        await reply_text(update, "用法: /bc_tpl_set <key> <模板内容>")
+        return
+    v = " ".join(context.args[1:]).strip()
+    with closing(db()) as conn:
+        conn.execute(
+            "INSERT INTO broadcast_templates(k, v, updated_at) VALUES(?,?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at",
+            (k, v, now_str()),
+        )
+        conn.execute("DELETE FROM broadcast_message_templates WHERE k=?", (k,))
+        conn.commit()
+    await reply_text(update, f"✅ 公告模板已保存(文本): {k}")
+
+
+async def cmd_bc_tpl_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
+        return
+    with closing(db()) as conn:
+        text_rows = conn.execute("SELECT k, v FROM broadcast_templates ORDER BY k").fetchall()
+        msg_rows = conn.execute("SELECT k, source_chat_id, source_message_id FROM broadcast_message_templates ORDER BY k").fetchall()
+    if not text_rows and not msg_rows:
+        await reply_text(update, "公告模板为空")
+        return
+    lines = ["公告模板："]
+    for r in text_rows:
+        lines.append(f"- {r['k']} [text]: {summarize(r['v'], 60)}")
+    for r in msg_rows:
+        lines.append(f"- {r['k']} [copy]: {r['source_chat_id']}:{r['source_message_id']}")
+    await reply_text(update, "\n".join(lines)[:3900])
+
+
+async def cmd_bc_tpl_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
+        return
+    if len(context.args) != 1:
+        await reply_text(update, "用法: /bc_tpl_del <key>")
+        return
+    k = context.args[0].strip().lower()
+    with closing(db()) as conn:
+        cur1 = conn.execute("DELETE FROM broadcast_templates WHERE k=?", (k,))
+        cur2 = conn.execute("DELETE FROM broadcast_message_templates WHERE k=?", (k,))
+        conn.commit()
+    if cur1.rowcount <= 0 and cur2.rowcount <= 0:
+        await reply_text(update, "模板不存在")
+        return
+    await reply_text(update, f"✅ 已删除模板: {k}")
+
+
+async def cmd_bc_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
+        return
+
+    msg = update.effective_message
+    if msg and msg.reply_to_message and not context.args:
+        src = msg.reply_to_message
+        await prepare_broadcast_confirm(
+            update,
+            context,
+            mode="copy",
+            source_chat_id=int(src.chat_id),
+            source_message_id=int(src.message_id),
+        )
+        return
+
+    raw = " ".join(context.args).strip()
+    if not raw:
+        await reply_text(update, "用法: /bc_send <内容> [|| k=v,k2=v2]\n或：回复消息后直接 /bc_send（保留原格式）")
+        return
+
+    content, var_part = raw, ""
+    if "||" in raw:
+        content, var_part = raw.split("||", 1)
+    vars_all = builtin_vars()
+    vars_all.update(parse_vars(var_part))
+    text = render_template(content.strip(), vars_all)
+    await prepare_broadcast_confirm(update, context, text=text, mode="text")
+
+
+async def cmd_bc_send_tpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
+        return
+    if not context.args:
+        await reply_text(update, "用法: /bc_send_tpl <key> [k=v,k2=v2]")
+        return
+    k = context.args[0].strip().lower()
+    var_part = " ".join(context.args[1:]).strip()
+
+    with closing(db()) as conn:
+        msg_tpl = conn.execute(
+            "SELECT source_chat_id, source_message_id FROM broadcast_message_templates WHERE k=?",
+            (k,),
+        ).fetchone()
+        txt_tpl = conn.execute("SELECT v FROM broadcast_templates WHERE k=?", (k,)).fetchone()
+
+    if msg_tpl:
+        await prepare_broadcast_confirm(
+            update,
+            context,
+            mode="copy",
+            source_chat_id=int(msg_tpl["source_chat_id"]),
+            source_message_id=int(msg_tpl["source_message_id"]),
+        )
+        return
+
+    if not txt_tpl:
+        await reply_text(update, f"模板不存在: {k}")
+        return
+
+    vars_all = builtin_vars()
+    vars_all.update(parse_vars(var_part))
+    text = render_template(txt_tpl["v"], vars_all)
+    await prepare_broadcast_confirm(update, context, text=text, mode="text")
+
+
+async def cmd_bc_vars(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_use_admin_cmd(update):
+        await reject_admin_cmd(update)
+        return
+    await reply_text(
+        update,
+        "内置变量：{{today}} {{now}} {{date}} {{time}}\n"
+        "自定义变量写法：k=v,k2=v2\n"
+        "示例：/bc_send_tpl notice name=张三,amount=100\n"
+        "保留原格式：回复目标消息后执行 /bc_send，或 /bc_tpl_set <key>（回复消息保存模板）",
+    )
+
+
 async def job_overdue(context: ContextTypes.DEFAULT_TYPE):
     rows = list_overdue_tasks(CURRENT_TASK_SLA_MINUTES)
     for r in rows:
@@ -1223,26 +1726,39 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def post_init(app: Application):
-    await app.bot.set_my_commands(
-        [
-            BotCommand("start", "启动信息"),
-            BotCommand("task_new", "手动建任务（回复消息）"),
-            BotCommand("task_list", "列出未完成任务"),
-            BotCommand("task_claim", "认领任务: /task_claim <id>"),
-            BotCommand("task_open", "回退OPEN: /task_open <id>"),
-            BotCommand("task_done", "完成任务: /task_done <id>"),
-            BotCommand("task_bind", "绑定订单: /task_bind <id> <order_no>"),
-            BotCommand("task_order", "查绑定订单: /task_order <id>"),
-            BotCommand("task_sla", "设置超时分钟: /task_sla <minutes>"),
-            BotCommand("task_panel", "任务管理面板"),
-            BotCommand("noise_ignore_list", "查看过滤用户名单"),
-            BotCommand("noise_ignore_add", "加入过滤用户: /noise_ignore_add <uid>"),
-            BotCommand("noise_ignore_del", "移出过滤用户: /noise_ignore_del <uid>"),
-            BotCommand("qr_add", "新增快捷语: /qr_add <key> <text>"),
-            BotCommand("qr_list", "快捷语列表"),
-            BotCommand("qr", "发送快捷语: /qr <key>"),
-        ]
-    )
+    full_cmds = [
+        BotCommand("start", "启动信息"),
+        BotCommand("task_new", "手动建任务（回复消息）"),
+        BotCommand("task_list", "列出未完成任务"),
+        BotCommand("task_claim", "认领任务: /task_claim <id>"),
+        BotCommand("task_open", "回退OPEN: /task_open <id>"),
+        BotCommand("task_done", "完成任务: /task_done <id>"),
+        BotCommand("task_bind", "绑定订单: /task_bind <id> <order_no>"),
+        BotCommand("task_order", "查绑定订单: /task_order <id>"),
+        BotCommand("task_sla", "设置超时分钟: /task_sla <minutes>"),
+        BotCommand("task_panel", "任务管理面板"),
+        BotCommand("noise_ignore_list", "查看过滤用户名单"),
+        BotCommand("noise_ignore_add", "加入过滤用户: /noise_ignore_add <uid>"),
+        BotCommand("noise_ignore_del", "移出过滤用户: /noise_ignore_del <uid>"),
+        BotCommand("support_group_list", "查看采集群名单"),
+        BotCommand("support_group_add", "加入采集群: /support_group_add <chat_id>"),
+        BotCommand("support_group_del", "移出采集群: /support_group_del <chat_id>"),
+        BotCommand("qr_add", "新增快捷语: /qr_add <key> <text>"),
+        BotCommand("qr_list", "快捷语列表"),
+        BotCommand("qr", "发送快捷语: /qr <key>"),
+        BotCommand("bc_tpl_set", "公告模板新增/更新: /bc_tpl_set <key> <text>"),
+        BotCommand("bc_tpl_list", "公告模板列表"),
+        BotCommand("bc_tpl_del", "删除公告模板: /bc_tpl_del <key>"),
+        BotCommand("bc_send", "直接群发: /bc_send <text> [|| vars]"),
+        BotCommand("bc_send_tpl", "模板群发: /bc_send_tpl <key> [vars]"),
+        BotCommand("bc_vars", "查看公告变量说明"),
+    ]
+    await app.bot.set_my_commands([BotCommand("start", "启动信息")], scope=BotCommandScopeDefault())
+    for cid in sorted(CONTROL_CHAT_IDS):
+        try:
+            await app.bot.set_my_commands(full_cmds, scope=BotCommandScopeChat(chat_id=cid))
+        except Exception as e:
+            logger.warning("set_my_commands scope chat failed chat_id=%s err=%s: %s", cid, e.__class__.__name__, e)
 
 
 def main():
@@ -1263,16 +1779,26 @@ def main():
     app.add_handler(CommandHandler("noise_ignore_list", cmd_noise_ignore_list))
     app.add_handler(CommandHandler("noise_ignore_add", cmd_noise_ignore_add))
     app.add_handler(CommandHandler("noise_ignore_del", cmd_noise_ignore_del))
+    app.add_handler(CommandHandler("support_group_list", cmd_support_group_list))
+    app.add_handler(CommandHandler("support_group_add", cmd_support_group_add))
+    app.add_handler(CommandHandler("support_group_del", cmd_support_group_del))
     app.add_handler(CommandHandler("qr_add", cmd_qr_add))
     app.add_handler(CommandHandler("qr_list", cmd_qr_list))
     app.add_handler(CommandHandler("qr", cmd_qr))
+    app.add_handler(CommandHandler("bc_tpl_set", cmd_bc_tpl_set))
+    app.add_handler(CommandHandler("bc_tpl_list", cmd_bc_tpl_list))
+    app.add_handler(CommandHandler("bc_tpl_del", cmd_bc_tpl_del))
+    app.add_handler(CommandHandler("bc_send", cmd_bc_send))
+    app.add_handler(CommandHandler("bc_send_tpl", cmd_bc_send_tpl))
+    app.add_handler(CommandHandler("bc_vars", cmd_bc_vars))
 
     app.add_handler(CallbackQueryHandler(on_panel_callback, pattern=r"^panel:"), group=-4)
+    app.add_handler(CallbackQueryHandler(on_broadcast_callback, pattern=r"^bc:(confirm|cancel):"), group=-3)
     app.add_handler(CallbackQueryHandler(on_task_qr_callback, pattern=r"^taskqr:[a-zA-Z0-9_\-]+:\d+$"), group=-3)
     app.add_handler(CallbackQueryHandler(on_task_action_callback, pattern=r"^task:(claim|open|done):\d+$"), group=-2)
     app.add_handler(MessageHandler(filters.Chat(chat_id=TASK_CHANNEL_ID) & filters.TEXT & filters.Regex(r"^/"), on_task_channel_command_fallback), group=-2)
     app.add_handler(MessageHandler(filters.Chat(chat_id=TASK_CHANNEL_ID) & (~filters.COMMAND), relay_from_task_channel), group=0)
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_message), group=1)
+    app.add_handler(MessageHandler(filters.TEXT, on_message), group=1)
     app.add_error_handler(on_error)
 
     app.job_queue.run_repeating(job_overdue, interval=60, first=20, name="overdue-reminder")
